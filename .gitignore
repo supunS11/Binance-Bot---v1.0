@@ -1,0 +1,38 @@
+# Environment variables
+.env
+
+# Python virtual environment
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# VS Code
+.vscode/
+
+# Logs
+logs/
+*.log
+
+# Runtime bot state
+data/open_trades.json
+data/signal_journal.csv
+data/signal_journal.bak_*.csv
+data/news_cache.json
+data/llm_cache.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+
+# Build files
+build/
+dist/
+*.egg-info/
