@@ -3,11 +3,46 @@ import time
 import pandas as pd
 
 import config
+from binance_rate_limit import (
+    get_private_api_backoff_seconds,
+    is_binance_rate_limit_error,
+    register_private_rate_limit
+)
 from exchange import client, get_klines
 from logger import log_warning
 
 
 _cache = {}
+
+
+def _wait_for_binance_backoff(label):
+    wait_seconds = get_private_api_backoff_seconds()
+
+    if wait_seconds <= 0:
+        return
+
+    log_warning(
+        "Binance API backoff active | "
+        f"CALL=data_confirmation:{label} | WAIT_SECONDS={round(wait_seconds, 1)}"
+    )
+    time.sleep(wait_seconds)
+
+
+def _record_rate_limit(error, label):
+    if not is_binance_rate_limit_error(error):
+        return False
+
+    wait_seconds = register_private_rate_limit(
+        error,
+        default_seconds=config.BINANCE_RATE_LIMIT_DEFAULT_BACKOFF_SECONDS,
+        buffer_seconds=config.BINANCE_RATE_LIMIT_BAN_BUFFER_SECONDS,
+    )
+    log_warning(
+        "Binance API rate limited | "
+        f"CALL=data_confirmation:{label} | "
+        f"PAUSE_SECONDS={round(wait_seconds, 1)} | ERROR={error}"
+    )
+    return True
 
 
 def _safe_float(value, default=0.0):
@@ -67,6 +102,7 @@ def _source_frame(symbol, entry_df):
 def _order_book_metrics(symbol):
     limit = max(int(getattr(config, "DATA_CONFIRMATION_ORDER_BOOK_LIMIT", 50)), 5)
     depth = max(int(getattr(config, "DATA_CONFIRMATION_ORDER_BOOK_DEPTH", 20)), 1)
+    _wait_for_binance_backoff("order_book")
     data = client.futures_order_book(symbol=symbol, limit=limit)
     bids = data.get("bids", [])[:depth]
     asks = data.get("asks", [])[:depth]
@@ -177,12 +213,14 @@ def _open_interest_bias(symbol, price_momentum):
     limit = max(int(getattr(config, "DATA_CONFIRMATION_OI_LIMIT", 12)), 2)
 
     try:
+        _wait_for_binance_backoff("open_interest")
         history = client.futures_open_interest_hist(
             symbol=symbol,
             period=period,
             limit=limit,
         )
     except Exception as exc:
+        _record_rate_limit(exc, "open_interest")
         return 0, None, f"OI:{exc}"
 
     if not history or len(history) < 2:
@@ -200,9 +238,11 @@ def _open_interest_bias(symbol, price_momentum):
 
 def _funding_bias(symbol):
     try:
+        _wait_for_binance_backoff("funding")
         premium = client.futures_mark_price(symbol=symbol)
         funding = _safe_float(premium.get("lastFundingRate"))
     except Exception as exc:
+        _record_rate_limit(exc, "funding")
         return 0, None, f"FUNDING:{exc}"
 
     max_abs = max(
@@ -218,11 +258,13 @@ def _liquidation_metrics(symbol):
         return 0, None
 
     try:
+        _wait_for_binance_backoff("liquidations")
         orders = client.futures_liquidation_orders(
             symbol=symbol,
             limit=max(int(getattr(config, "DATA_CONFIRMATION_LIQUIDATION_LIMIT", 50)), 1),
         )
     except Exception as exc:
+        _record_rate_limit(exc, "liquidations")
         return 0, f"LIQ:{exc}"
 
     buy_liq = 0.0
@@ -426,6 +468,7 @@ def confirm_market_data(symbol, chart_side, entry_df=None):
         return _cache_set(symbol, context)
 
     except Exception as exc:
+        _record_rate_limit(exc, "confirm_market_data")
         log_warning(f"{symbol} data confirmation error: {exc}")
         context.update({
             "ok": bool(getattr(config, "DATA_CONFIRMATION_FAIL_OPEN", False)),

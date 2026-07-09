@@ -6,6 +6,11 @@ import time
 import numpy as np
 
 import config
+from binance_rate_limit import (
+    get_private_api_backoff_seconds,
+    is_binance_rate_limit_error,
+    register_private_rate_limit
+)
 from indicators import apply_indicators
 from logger import log_info, log_warning, log_error
 
@@ -15,11 +20,46 @@ _exchange_info_cache = None
 _last_kline_request_at = 0.0
 _futures_context_cache = {}
 
+
+def _wait_for_private_api_backoff(label):
+    wait_seconds = get_private_api_backoff_seconds()
+
+    if wait_seconds <= 0:
+        return
+
+    log_warning(
+        "Binance API backoff active | "
+        f"CALL={label} | WAIT_SECONDS={round(wait_seconds, 1)}"
+    )
+    time.sleep(wait_seconds)
+
+
+def _record_private_rate_limit(error, label):
+    if not is_binance_rate_limit_error(error):
+        return False
+
+    wait_seconds = register_private_rate_limit(
+        error,
+        default_seconds=config.BINANCE_RATE_LIMIT_DEFAULT_BACKOFF_SECONDS,
+        buffer_seconds=config.BINANCE_RATE_LIMIT_BAN_BUFFER_SECONDS
+    )
+    log_warning(
+        "Binance API rate limited | "
+        f"CALL={label} | PAUSE_SECONDS={round(wait_seconds, 1)} | ERROR={error}"
+    )
+    return True
+
 # =========================
 # SYNC TIME
 # =========================
-server_time = client.get_server_time()
-client.timestamp_offset = server_time['serverTime'] - int(time.time() * 1000)
+try:
+    _wait_for_private_api_backoff("server_time")
+    server_time = client.get_server_time()
+    client.timestamp_offset = server_time['serverTime'] - int(time.time() * 1000)
+except Exception as e:
+    _record_private_rate_limit(e, "server_time")
+    client.timestamp_offset = 0
+    log_warning(f"Server time sync failed; using local clock offset | ERROR={e}")
 
 
 def _throttle_kline_request():
@@ -42,7 +82,12 @@ def get_exchange_info():
     global _exchange_info_cache
 
     if _exchange_info_cache is None:
-        _exchange_info_cache = client.futures_exchange_info()
+        try:
+            _wait_for_private_api_backoff("exchange_info")
+            _exchange_info_cache = client.futures_exchange_info()
+        except Exception as e:
+            _record_private_rate_limit(e, "exchange_info")
+            raise
 
     return _exchange_info_cache
 
@@ -101,6 +146,7 @@ def _change_pct(items, field):
 
 def _get_taker_longshort_ratio(params):
     method = getattr(client, "futures_taker_longshort_ratio", None)
+    _wait_for_private_api_backoff("taker_longshort_ratio")
 
     if method:
         return method(**params)
@@ -143,9 +189,11 @@ def get_futures_participation(symbol):
     }
 
     try:
+        _wait_for_private_api_backoff("open_interest_hist")
         oi_hist = client.futures_open_interest_hist(**params)
         data["oi_change_pct"] = _change_pct(oi_hist, "sumOpenInterest")
     except Exception as e:
+        _record_private_rate_limit(e, "open_interest_hist")
         data["errors"].append(f"OI:{e}")
 
     try:
@@ -154,28 +202,35 @@ def get_futures_participation(symbol):
             taker.get("buySellRatio") if taker else None
         )
     except Exception as e:
+        _record_private_rate_limit(e, "taker_longshort_ratio")
         data["errors"].append(f"TAKER:{e}")
 
     try:
+        _wait_for_private_api_backoff("global_longshort_ratio")
         global_ratio = _latest_item(client.futures_global_longshort_ratio(**params))
         data["global_long_short_ratio"] = _to_float(
             global_ratio.get("longShortRatio") if global_ratio else None
         )
     except Exception as e:
+        _record_private_rate_limit(e, "global_longshort_ratio")
         data["errors"].append(f"GLOBAL_LS:{e}")
 
     try:
+        _wait_for_private_api_backoff("top_longshort_position_ratio")
         top_ratio = _latest_item(client.futures_top_longshort_position_ratio(**params))
         data["top_long_short_ratio"] = _to_float(
             top_ratio.get("longShortRatio") if top_ratio else None
         )
     except Exception as e:
+        _record_private_rate_limit(e, "top_longshort_position_ratio")
         data["errors"].append(f"TOP_LS:{e}")
 
     try:
+        _wait_for_private_api_backoff("mark_price_funding")
         premium = client.futures_mark_price(symbol=symbol)
         data["funding_rate"] = _to_float(premium.get("lastFundingRate"))
     except Exception as e:
+        _record_private_rate_limit(e, "mark_price_funding")
         data["errors"].append(f"FUNDING:{e}")
 
     usable_values = [
@@ -205,6 +260,7 @@ def get_futures_participation(symbol):
 def set_margin_type(symbol, allow_open_order_block=False):
 
     try:
+        _wait_for_private_api_backoff("change_margin_type")
         client.futures_change_margin_type(
             symbol=symbol,
             marginType=config.MARGIN_TYPE
@@ -214,6 +270,9 @@ def set_margin_type(symbol, allow_open_order_block=False):
         return True
 
     except Exception as e:
+        if _record_private_rate_limit(e, "change_margin_type"):
+            return False
+
         message = str(e)
 
         if (
@@ -245,6 +304,7 @@ def set_margin_type(symbol, allow_open_order_block=False):
 def setup_leverage(symbol):
 
     try:
+        _wait_for_private_api_backoff("change_leverage")
 
         response = client.futures_change_leverage(
             symbol=symbol,
@@ -261,6 +321,7 @@ def setup_leverage(symbol):
         return True
 
     except Exception as e:
+        _record_private_rate_limit(e, "change_leverage")
         log_error(f"{symbol} leverage error: {e}")
         return False
 
@@ -270,29 +331,47 @@ def setup_leverage(symbol):
 # =========================
 def get_balance():
 
-    balances = client.futures_account_balance()
+    try:
+        _wait_for_private_api_backoff("account_balance")
+        balances = client.futures_account_balance()
 
-    for b in balances:
-        if b['asset'] == 'USDT':
-            return float(b['balance'])
+        for b in balances:
+            if b['asset'] == 'USDT':
+                return float(b['balance'])
 
-    return 0
+        return 0
+
+    except Exception as e:
+        _record_private_rate_limit(e, "account_balance")
+        raise
 
 
 def get_margin_balance():
-    return float(client.futures_account()['totalMarginBalance'])
+    try:
+        _wait_for_private_api_backoff("futures_account_margin_balance")
+        return float(client.futures_account()['totalMarginBalance'])
+    except Exception as e:
+        _record_private_rate_limit(e, "futures_account_margin_balance")
+        raise
 
 
 def get_unrealized_pnl():
-    return float(client.futures_account()['totalUnrealizedProfit'])
+    try:
+        _wait_for_private_api_backoff("futures_account_unrealized_pnl")
+        return float(client.futures_account()['totalUnrealizedProfit'])
+    except Exception as e:
+        _record_private_rate_limit(e, "futures_account_unrealized_pnl")
+        raise
 
 
 def get_mark_price(symbol):
 
     try:
+        _wait_for_private_api_backoff("mark_price")
         return float(client.futures_mark_price(symbol=symbol)['markPrice'])
 
     except Exception as e:
+        _record_private_rate_limit(e, "mark_price")
         log_error(f"{symbol} mark price error: {e}")
         return None
 
@@ -304,6 +383,7 @@ def get_klines(symbol, interval, limit=None):
 
     try:
         limit = limit if limit is not None else config.KLINE_LIMIT
+        _wait_for_private_api_backoff("klines")
         _throttle_kline_request()
 
         klines = client.futures_klines(
@@ -323,6 +403,7 @@ def get_klines(symbol, interval, limit=None):
         return df
 
     except Exception as e:
+        _record_private_rate_limit(e, "klines")
         log_error(f"{symbol} klines error: {e}")
         return None
 
@@ -333,6 +414,7 @@ def get_klines(symbol, interval, limit=None):
 def has_open_position(symbol):
 
     try:
+        _wait_for_private_api_backoff("position_information")
         positions = client.futures_position_information(symbol=symbol)
 
         for p in positions:
@@ -342,6 +424,7 @@ def has_open_position(symbol):
         return False
 
     except Exception as e:
+        _record_private_rate_limit(e, "position_information")
         log_error(str(e))
         return False
 
@@ -349,6 +432,7 @@ def has_open_position(symbol):
 def is_position_closed(symbol):
 
     try:
+        _wait_for_private_api_backoff("position_information")
         positions = client.futures_position_information(symbol=symbol)
 
         for p in positions:
@@ -358,6 +442,7 @@ def is_position_closed(symbol):
         return True
 
     except Exception as e:
+        _record_private_rate_limit(e, "position_information")
         log_error(f"{symbol} position check error: {e}")
         return False
 
@@ -365,6 +450,7 @@ def is_position_closed(symbol):
 def get_open_positions():
 
     try:
+        _wait_for_private_api_backoff("all_position_information")
         positions = client.futures_position_information()
         open_positions = {}
 
@@ -377,6 +463,7 @@ def get_open_positions():
         return open_positions
 
     except Exception as e:
+        _record_private_rate_limit(e, "all_position_information")
         log_error(f"open positions error: {e}")
         return None
 
@@ -408,6 +495,7 @@ def _build_open_position_detail(position):
 def get_open_position_detail_rows(symbol=None):
 
     try:
+        _wait_for_private_api_backoff("position_detail_rows")
         if symbol:
             positions = client.futures_position_information(symbol=symbol)
         else:
@@ -424,6 +512,7 @@ def get_open_position_detail_rows(symbol=None):
         return open_positions
 
     except Exception as e:
+        _record_private_rate_limit(e, "position_detail_rows")
         label = symbol if symbol else "all"
         log_error(f"{label} open position row detail error: {e}")
         return None
@@ -479,6 +568,7 @@ def get_open_position_counts(open_positions=None):
 
 def _get_open_algo_orders(symbol):
     method = getattr(client, "futures_get_open_algo_orders", None)
+    _wait_for_private_api_backoff("open_algo_orders")
 
     if method:
         return method(symbol=symbol)
@@ -493,6 +583,7 @@ def _get_open_algo_orders(symbol):
 
 def _cancel_algo_order(symbol, algo_id):
     method = getattr(client, "futures_cancel_algo_order", None)
+    _wait_for_private_api_backoff("cancel_algo_order")
 
     if method:
         return method(symbol=symbol, algoId=algo_id)
@@ -529,6 +620,7 @@ def get_open_take_profit_info(symbol):
     try:
         tp_types = {"TAKE_PROFIT", "TAKE_PROFIT_MARKET"}
 
+        _wait_for_private_api_backoff("open_orders")
         for order in client.futures_get_open_orders(symbol=symbol):
             order_type = order.get("type")
 
@@ -560,6 +652,7 @@ def get_open_take_profit_info(symbol):
         return {}
 
     except Exception as e:
+        _record_private_rate_limit(e, "open_take_profit_info")
         log_warning(f"{symbol} open TP lookup error: {e}")
         return {}
 
@@ -567,6 +660,7 @@ def get_open_take_profit_info(symbol):
 def cancel_open_protection_orders(symbol):
 
     try:
+        _wait_for_private_api_backoff("open_orders")
         orders = client.futures_get_open_orders(symbol=symbol)
         protection_types = {
             "TAKE_PROFIT",
@@ -618,6 +712,7 @@ def cancel_open_protection_orders(symbol):
         return True
 
     except Exception as e:
+        _record_private_rate_limit(e, "cancel_open_protection_orders")
         log_error(f"{symbol} protection cancel error: {e}")
         return False
 
@@ -669,6 +764,7 @@ def get_entry_price(symbol, order=None):
 
     for attempt in range(config.ENTRY_PRICE_RETRIES):
         try:
+            _wait_for_private_api_backoff("entry_price_position_information")
             positions = client.futures_position_information(symbol=symbol)
             entry_price = abs(float(positions[0]["entryPrice"]))
 
@@ -676,6 +772,7 @@ def get_entry_price(symbol, order=None):
                 return entry_price
 
         except Exception as e:
+            _record_private_rate_limit(e, "entry_price_position_information")
             last_error = e
 
         if attempt < config.ENTRY_PRICE_RETRIES - 1:
@@ -693,6 +790,7 @@ def get_entry_price(symbol, order=None):
 def place_market_order(symbol, side, quantity):
 
     try:
+        _wait_for_private_api_backoff("market_order")
 
         order = client.futures_create_order(
             symbol=symbol,
@@ -706,6 +804,7 @@ def place_market_order(symbol, side, quantity):
         return order
 
     except Exception as e:
+        _record_private_rate_limit(e, "market_order")
         log_error(f"{symbol} order error: {e}")
         return None
 
@@ -734,6 +833,7 @@ def _submit_close_order(symbol, side, quantity, position_side=None, reduce_only=
     elif reduce_only:
         params["reduceOnly"] = True
 
+    _wait_for_private_api_backoff("close_position_order")
     return client.futures_create_order(**params)
 
 
@@ -797,6 +897,7 @@ def close_position_market(symbol, amount, position_side=None):
             return order
 
     except Exception as e:
+        _record_private_rate_limit(e, "close_position_order")
         log_error(f"{symbol} close position error: {e}")
         return None
 
@@ -848,15 +949,22 @@ def is_valid_take_profit(side, tp_price, market_price):
 def place_algo_order(**params):
     method = getattr(client, "futures_create_algo_order", None)
 
-    if method:
-        return method(**params)
+    try:
+        _wait_for_private_api_backoff("algo_order")
 
-    return client._request_futures_api(
-        "post",
-        "algoOrder",
-        True,
-        data=params
-    )
+        if method:
+            return method(**params)
+
+        return client._request_futures_api(
+            "post",
+            "algoOrder",
+            True,
+            data=params
+        )
+
+    except Exception as e:
+        _record_private_rate_limit(e, "algo_order")
+        raise
 
 
 # =========================
