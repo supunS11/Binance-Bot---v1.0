@@ -244,15 +244,30 @@ def _liquidation_metrics(symbol):
     return _clamp(imbalance, -1, 1), None
 
 
-def _classify_metric(name, value, side, confirmations, conflicts):
+def _metric_weight(name, default):
+    return max(_safe_float(getattr(config, name, default), default), 0)
+
+
+def _classify_metric(name, value, weight, side, confirmations, conflicts):
+    min_weight = float(
+        getattr(config, "DATA_CONFIRMATION_MIN_CONFIRMATION_WEIGHT", 0.50)
+    )
+
+    if weight < min_weight:
+        return
+
     signed = value if side == "BUY" else -value
     confirm_at = float(getattr(config, "DATA_CONFIRMATION_METRIC_CONFIRM_AT", 0.08))
     conflict_at = -float(getattr(config, "DATA_CONFIRMATION_METRIC_CONFLICT_AT", 0.08))
 
     if signed >= confirm_at:
         confirmations.append(name)
+        return "confirm"
     elif signed <= conflict_at:
         conflicts.append(name)
+        return "conflict"
+
+    return None
 
 
 def confirm_market_data(symbol, chart_side, entry_df=None):
@@ -305,32 +320,83 @@ def confirm_market_data(symbol, chart_side, entry_df=None):
             if error
         ]
         weighted = {
-            "order_book": (metrics["order_book_imbalance"], 1.15),
-            "cvd": (metrics["cvd_imbalance"], 1.45),
-            "cvd_trend": (metrics["cvd_trend"], 0.85),
-            "volume_delta": (metrics["volume_delta"], 0.95),
-            "open_interest": (metrics["open_interest_bias"], 0.85),
-            "funding": (metrics["funding_bias"], 0.45),
-            "liquidations": (metrics["liquidation_imbalance"], 0.55),
-            "whale_orders": (metrics["whale_imbalance"], 0.80),
+            "order_book": (
+                metrics["order_book_imbalance"],
+                _metric_weight("DATA_CONFIRMATION_WEIGHT_ORDER_BOOK", 0.50),
+            ),
+            "cvd": (
+                metrics["cvd_imbalance"],
+                _metric_weight("DATA_CONFIRMATION_WEIGHT_CVD", 1.60),
+            ),
+            "cvd_trend": (
+                metrics["cvd_trend"],
+                _metric_weight("DATA_CONFIRMATION_WEIGHT_CVD_TREND", 1.10),
+            ),
+            "volume_delta": (
+                metrics["volume_delta"],
+                _metric_weight("DATA_CONFIRMATION_WEIGHT_VOLUME_DELTA", 1.10),
+            ),
+            "open_interest": (
+                metrics["open_interest_bias"],
+                _metric_weight("DATA_CONFIRMATION_WEIGHT_OPEN_INTEREST", 0.90),
+            ),
+            "funding": (
+                metrics["funding_bias"],
+                _metric_weight("DATA_CONFIRMATION_WEIGHT_FUNDING", 0.10),
+            ),
+            "liquidations": (
+                metrics["liquidation_imbalance"],
+                _metric_weight("DATA_CONFIRMATION_WEIGHT_LIQUIDATIONS", 0.15),
+            ),
+            "whale_orders": (
+                metrics["whale_imbalance"],
+                _metric_weight("DATA_CONFIRMATION_WEIGHT_WHALE_ORDERS", 0.20),
+            ),
+        }
+        weighted = {
+            name: item
+            for name, item in weighted.items()
+            if item[1] > 0
         }
         total_weight = sum(weight for _value, weight in weighted.values())
+        if total_weight <= 0:
+            total_weight = 1
         directional_score = sum(
             value * weight
             for value, weight in weighted.values()
         ) / total_weight
         directional_score = _clamp(directional_score, -1, 1)
+        score_scale = max(
+            _safe_float(getattr(config, "DATA_CONFIRMATION_SCORE_SCALE", 0.18), 0.18),
+            0.01,
+        )
+        scaled_directional_score = _clamp(directional_score / score_scale, -1, 1)
 
         side = "BUY" if directional_score > 0 else "SELL" if directional_score < 0 else "NEUTRAL"
-        confidence = round(50 + abs(directional_score) * 50, 2)
-        edge = round(abs(directional_score) * 100, 2)
-        buy_score = round(50 + directional_score * 50, 2)
-        sell_score = round(50 - directional_score * 50, 2)
+        raw_edge = round(abs(directional_score) * 100, 2)
+        edge = round(abs(scaled_directional_score) * 100, 2)
+        confidence = round(50 + (edge * 0.5), 2)
+        buy_score = round(50 + scaled_directional_score * 50, 2)
+        sell_score = round(50 - scaled_directional_score * 50, 2)
         confirmations = []
         conflicts = []
+        confirmation_score = 0.0
+        conflict_score = 0.0
 
-        for name, (value, _weight) in weighted.items():
-            _classify_metric(name, value, side, confirmations, conflicts)
+        for name, (value, weight) in weighted.items():
+            classification = _classify_metric(
+                name,
+                value,
+                weight,
+                side,
+                confirmations,
+                conflicts,
+            )
+
+            if classification == "confirm":
+                confirmation_score += weight
+            elif classification == "conflict":
+                conflict_score += weight
 
         context = {
             "enabled": True,
@@ -338,12 +404,21 @@ def confirm_market_data(symbol, chart_side, entry_df=None):
             "side": side,
             "confidence": confidence,
             "edge": edge,
+            "raw_edge": raw_edge,
+            "directional_score": round(directional_score, 5),
+            "scaled_directional_score": round(scaled_directional_score, 5),
             "buy_score": buy_score,
             "sell_score": sell_score,
             "reason": "",
             "confirmations": confirmations,
             "conflicts": conflicts,
+            "confirmation_score": round(confirmation_score, 2),
+            "conflict_score": round(conflict_score, 2),
             "metrics": metrics,
+            "weights": {
+                name: weight
+                for name, (_value, weight) in weighted.items()
+            },
             "errors": errors,
         }
         context["ok"] = _decision_ok(context, chart_side)
@@ -374,7 +449,25 @@ def _decision_ok(context, chart_side):
     if context.get("edge", 0) < getattr(config, "DATA_CONFIRMATION_MIN_EDGE", 12):
         return False
 
-    if len(context.get("confirmations", [])) < getattr(config, "DATA_CONFIRMATION_MIN_CONFIRMATIONS", 3):
+    confirmations = len(context.get("confirmations", []))
+    confirmation_score = context.get("confirmation_score", 0)
+    min_confirmations = getattr(config, "DATA_CONFIRMATION_MIN_CONFIRMATIONS", 3)
+    min_confirmation_score = getattr(
+        config,
+        "DATA_CONFIRMATION_MIN_CONFIRMATION_SCORE",
+        2.40,
+    )
+
+    if (
+        confirmations < min_confirmations
+        and confirmation_score < min_confirmation_score
+    ):
+        return False
+
+    if len(context.get("conflicts", [])) > getattr(config, "DATA_CONFIRMATION_MAX_CONFLICTS", 1):
+        return False
+
+    if context.get("conflict_score", 0) > getattr(config, "DATA_CONFIRMATION_MAX_CONFLICT_SCORE", 1.25):
         return False
 
     return True
@@ -403,11 +496,36 @@ def _decision_reason(context, chart_side):
 
     confirmations = len(context.get("confirmations", []))
     min_confirmations = getattr(config, "DATA_CONFIRMATION_MIN_CONFIRMATIONS", 3)
+    confirmation_score = context.get("confirmation_score", 0)
+    min_confirmation_score = getattr(
+        config,
+        "DATA_CONFIRMATION_MIN_CONFIRMATION_SCORE",
+        2.40,
+    )
 
-    if confirmations < min_confirmations:
-        return f"DATA_CONFIRMATIONS_LOW {confirmations} < {min_confirmations}"
+    if (
+        confirmations < min_confirmations
+        and confirmation_score < min_confirmation_score
+    ):
+        return (
+            f"DATA_CONFIRMATIONS_LOW count={confirmations}/{min_confirmations} "
+            f"score={confirmation_score}/{min_confirmation_score}"
+        )
+
+    conflicts = len(context.get("conflicts", []))
+    max_conflicts = getattr(config, "DATA_CONFIRMATION_MAX_CONFLICTS", 1)
+
+    if conflicts > max_conflicts:
+        return f"DATA_CONFLICTS_HIGH {conflicts} > {max_conflicts}"
+
+    conflict_score = context.get("conflict_score", 0)
+    max_conflict_score = getattr(config, "DATA_CONFIRMATION_MAX_CONFLICT_SCORE", 1.25)
+
+    if conflict_score > max_conflict_score:
+        return f"DATA_CONFLICT_SCORE_HIGH {conflict_score} > {max_conflict_score}"
 
     return (
         f"DATA_{side}_CONFIRMED confidence={confidence} "
-        f"edge={edge} confirmations={confirmations}"
+        f"edge={edge} confirmations={confirmations} "
+        f"confirmation_score={confirmation_score}"
     )
