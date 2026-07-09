@@ -9,6 +9,10 @@ import config
 from binance.enums import SIDE_BUY, SIDE_SELL
 
 from adaptive_tp import calculate_adaptive_fallback_tp
+from binance_rate_limit import (
+    get_rate_limit_backoff_seconds,
+    is_binance_rate_limit_error
+)
 from data_confirmation import confirm_market_data
 from exchange import (
     get_klines,
@@ -1657,11 +1661,20 @@ class TargetMarginBalanceMonitor:
         self.thread = None
         self.stop_event = threading.Event()
 
+    def _check_interval(self):
+        configured = max(float(config.TARGET_MARGIN_BALANCE_CHECK_SECONDS), 0.2)
+        minimum = max(
+            float(getattr(config, "TARGET_MARGIN_BALANCE_MIN_CHECK_SECONDS", 10)),
+            0.2
+        )
+        return max(configured, minimum)
+
     def start(self):
         if not self.enabled:
             log_info("Target margin balance stop disabled")
             return
 
+        interval = self._check_interval()
         self.thread = threading.Thread(
             target=self._run,
             name="target-margin-balance-monitor",
@@ -1671,14 +1684,15 @@ class TargetMarginBalanceMonitor:
         log_info(
             "Target margin balance monitor started | "
             f"TARGET={config.TARGET_MARGIN_BALANCE} | "
-            f"CHECK_SECONDS={config.TARGET_MARGIN_BALANCE_CHECK_SECONDS}"
+            f"CHECK_SECONDS={interval} | "
+            f"CONFIGURED_SECONDS={config.TARGET_MARGIN_BALANCE_CHECK_SECONDS}"
         )
 
     def stop(self):
         self.stop_event.set()
 
     def _run(self):
-        interval = max(float(config.TARGET_MARGIN_BALANCE_CHECK_SECONDS), 0.2)
+        interval = self._check_interval()
 
         while not self.stop_event.is_set() and not shutdown_event.is_set():
             try:
@@ -1689,6 +1703,19 @@ class TargetMarginBalanceMonitor:
                     return
 
             except Exception as e:
+                if is_binance_rate_limit_error(e):
+                    pause_seconds = get_rate_limit_backoff_seconds(
+                        e,
+                        default_seconds=config.BINANCE_RATE_LIMIT_DEFAULT_BACKOFF_SECONDS,
+                        buffer_seconds=config.BINANCE_RATE_LIMIT_BAN_BUFFER_SECONDS
+                    )
+                    log_warning(
+                        "Target margin balance monitor rate limited | "
+                        f"PAUSE_SECONDS={round(pause_seconds, 1)} | ERROR={e}"
+                    )
+                    self.stop_event.wait(pause_seconds)
+                    continue
+
                 log_error(f"Target margin balance monitor error: {e}")
 
             self.stop_event.wait(interval)
