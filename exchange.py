@@ -953,13 +953,9 @@ def place_tp_sl(
             and structure_tp.get("target_price")
             and not is_valid_take_profit(side, tp_price, market_price)
         ):
-            log_warning(f"{symbol} STRUCTURE TP INVALID | USING FALLBACK ROI")
-            tp_mode = f"FALLBACK_ROI_{config.STRUCTURE_TP_FALLBACK_ROI}%"
-            tp_price = get_roi_take_profit(
-                side,
-                entry_price,
-                config.STRUCTURE_TP_FALLBACK_ROI,
-                precision
+            log_warning(
+                f"{symbol} STRUCTURE TP INVALID | "
+                f"RECOVERY WILL TRY FALLBACK TP"
             )
 
         details.update({

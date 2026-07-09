@@ -8,6 +8,7 @@ import config
 
 from binance.enums import SIDE_BUY, SIDE_SELL
 
+from adaptive_tp import calculate_adaptive_fallback_tp
 from data_confirmation import confirm_market_data
 from exchange import (
     get_klines,
@@ -491,68 +492,126 @@ def place_tp_sl_with_recovery(
     structure_tp=None,
     roi_override=None,
     roi_mode_label=None,
+    chart_analysis=None,
+    data_context=None,
+    signal_type=None,
+    dca_count=0,
     context_label="ENTRY",
     return_details=True
 ):
     attempts = max(int(config.TP_ORDER_RETRY_ATTEMPTS), 1)
     last_result = {}
+    explicit_roi_override = roi_override is not None
+    structure_available = (
+        not explicit_roi_override
+        and bool(structure_tp)
+        and bool(structure_tp.get("target_price"))
+    )
 
-    for attempt in range(1, attempts + 1):
-        result = place_tp_sl(
-            symbol,
-            side,
-            entry_price,
-            quantity,
-            confirm_df,
-            structure_tp=structure_tp,
-            roi_override=roi_override,
-            roi_mode_label=roi_mode_label,
-            return_details=True
-        )
-        last_result = result or {}
+    def try_place(mode_label, structure_tp_arg=None, roi_arg=None, roi_label=None):
+        nonlocal last_result
 
-        if last_result.get("ok"):
-            if attempt > 1:
+        for attempt in range(1, attempts + 1):
+            result = place_tp_sl(
+                symbol,
+                side,
+                entry_price,
+                quantity,
+                confirm_df,
+                structure_tp=structure_tp_arg,
+                roi_override=roi_arg,
+                roi_mode_label=roi_label,
+                return_details=True
+            )
+            last_result = result or {}
+
+            if last_result.get("ok"):
                 log_info(
                     f"{symbol} TP recovery succeeded | "
-                    f"CONTEXT={context_label} | ATTEMPT={attempt}"
+                    f"CONTEXT={context_label} | TIER={mode_label} | "
+                    f"ATTEMPT={attempt} | MODE={last_result.get('tp_mode')}"
                 )
+                return last_result
 
-            return last_result if return_details else True
+            log_warning(
+                f"{symbol} TP placement failed | "
+                f"CONTEXT={context_label} | TIER={mode_label} | "
+                f"ATTEMPT={attempt}/{attempts} | MODE={last_result.get('tp_mode')}"
+            )
 
-        log_warning(
-            f"{symbol} TP placement failed | "
-            f"CONTEXT={context_label} | ATTEMPT={attempt}/{attempts} | "
-            f"MODE={last_result.get('tp_mode')}"
+            if attempt < attempts and config.TP_ORDER_RETRY_DELAY_SECONDS > 0:
+                time.sleep(config.TP_ORDER_RETRY_DELAY_SECONDS)
+
+        return None
+
+    if structure_available:
+        placed = try_place("STRUCTURE", structure_tp_arg=structure_tp)
+
+        if placed:
+            return placed if return_details else True
+    elif explicit_roi_override or config.STATIC_TP_ENABLED:
+        placed = try_place(
+            "PRIMARY_ROI",
+            roi_arg=roi_override,
+            roi_label=roi_mode_label
         )
 
-        if attempt < attempts and config.TP_ORDER_RETRY_DELAY_SECONDS > 0:
-            time.sleep(config.TP_ORDER_RETRY_DELAY_SECONDS)
+        if placed:
+            return placed if return_details else True
+    else:
+        log_warning(
+            f"{symbol} TP structure unavailable | "
+            f"CONTEXT={context_label} | TRYING ADAPTIVE FALLBACK"
+        )
+
+    adaptive_tp = {}
+
+    if not explicit_roi_override:
+        adaptive_tp = calculate_adaptive_fallback_tp(
+            side,
+            analysis=chart_analysis,
+            data_context=data_context,
+            signal_type=signal_type,
+            dca_count=dca_count,
+        )
+
+        if adaptive_tp.get("ok"):
+            log_info(
+                f"{symbol} ADAPTIVE FALLBACK TP | "
+                f"CONTEXT={context_label} | ROI={adaptive_tp.get('roi')}% | "
+                f"{adaptive_tp.get('reason')}"
+            )
+            placed = try_place(
+                "ADAPTIVE_FALLBACK",
+                roi_arg=adaptive_tp.get("roi"),
+                roi_label=adaptive_tp.get("mode")
+            )
+
+            if placed:
+                return placed if return_details else True
+        else:
+            log_warning(
+                f"{symbol} adaptive fallback TP unavailable | "
+                f"CONTEXT={context_label} | REASON={adaptive_tp.get('reason')}"
+            )
 
     if (
         config.TP_FAILURE_FALLBACK_ROI_ENABLED
-        and roi_override is None
+        and not explicit_roi_override
     ):
         fallback_roi = config.STRUCTURE_TP_FALLBACK_ROI
         log_warning(
-            f"{symbol} TP recovery fallback ROI | "
+            f"{symbol} STATIC EMERGENCY TP fallback ROI | "
             f"CONTEXT={context_label} | ROI={fallback_roi}%"
         )
-        fallback_result = place_tp_sl(
-            symbol,
-            side,
-            entry_price,
-            quantity,
-            confirm_df,
-            structure_tp=None,
-            roi_override=fallback_roi,
-            roi_mode_label=f"TP_RECOVERY_ROI_{fallback_roi}%",
-            return_details=True
+        placed = try_place(
+            "STATIC_EMERGENCY",
+            roi_arg=fallback_roi,
+            roi_label=f"STATIC_EMERGENCY_ROI_{fallback_roi}%"
         )
-        last_result = fallback_result or last_result
 
-        if last_result.get("ok"):
-            return last_result if return_details else True
+        if placed:
+            return placed if return_details else True
 
     send_tp_failure_message(
         symbol,
@@ -965,11 +1024,11 @@ def _manage_dca_position_legacy(symbol, state, position_detail, btc_trend_df, bt
         else:
             log_warning(
                 f"{symbol} DCA {structure_tp['reason']} | "
-                f"USING FALLBACK ROI TP"
+                f"USING FALLBACK TP CHAIN"
             )
     elif not config.STATIC_TP_ENABLED and force_remaining_dca:
         log_warning(
-            f"{symbol} FORCE DCA using fallback ROI TP | "
+            f"{symbol} FORCE DCA using fallback TP chain | "
             f"signal frames unavailable"
         )
 
@@ -982,6 +1041,17 @@ def _manage_dca_position_legacy(symbol, state, position_detail, btc_trend_df, bt
                 total_quantity,
                 confirm_df,
                 structure_tp=structure_tp,
+                chart_analysis=analysis,
+                data_context=position_state.get("data_confirmation"),
+                signal_type=(
+                    position_state.get("confirmation_type") or
+                    position_state.get("signal_type")
+                ),
+                dca_count=(
+                    dca_count + get_remaining_dca_order_count(dca_count)
+                    if force_remaining_dca
+                    else dca_count + 1
+                ),
                 context_label="LEGACY_DCA",
                 return_details=False
             )
@@ -1270,11 +1340,11 @@ def manage_dca_position(
         else:
             log_warning(
                 f"{symbol} DCA {structure_tp['reason']} | "
-                f"USING FALLBACK ROI TP"
+                f"USING FALLBACK TP CHAIN"
             )
     elif not config.STATIC_TP_ENABLED:
         log_warning(
-            f"{symbol} DCA using fallback ROI TP | signal frames unavailable"
+            f"{symbol} DCA using fallback TP chain | signal frames unavailable"
         )
 
     old_tp_info = get_open_take_profit_info(symbol)
@@ -1295,6 +1365,13 @@ def manage_dca_position(
                     if dca_tp_roi is not None
                     else None
                 ),
+                chart_analysis=analysis,
+                data_context=position_state.get("data_confirmation"),
+                signal_type=(
+                    position_state.get("confirmation_type") or
+                    position_state.get("signal_type")
+                ),
+                dca_count=dca_count + 1,
                 context_label=f"DCA_LEVEL_{dca_count + 1}",
                 return_details=True
             )
@@ -2439,7 +2516,7 @@ def execute_entry_candidate(
                 )
             else:
                 log_warning(
-                    f"{symbol} {structure_tp['reason']} | USING FALLBACK ROI TP"
+                    f"{symbol} {structure_tp['reason']} | USING FALLBACK TP CHAIN"
                 )
 
         protection_result = place_tp_sl_with_recovery(
@@ -2449,6 +2526,9 @@ def execute_entry_candidate(
             quantity,
             confirm_df,
             structure_tp=structure_tp,
+            chart_analysis=final_analysis,
+            data_context=data_context,
+            signal_type=signal_type,
             context_label="ENTRY",
             return_details=True
         )
