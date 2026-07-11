@@ -35,6 +35,9 @@ def _sign(value):
 class RealtimeMarketDataMonitor:
     def __init__(self, symbols, shutdown_event=None):
         self.enabled = bool(getattr(config, "DATA_CONFIRMATION_REALTIME_ENABLED", True))
+        self.on_demand = bool(
+            getattr(config, "DATA_CONFIRMATION_REALTIME_ON_DEMAND", True)
+        )
         max_symbols = int(getattr(config, "DATA_CONFIRMATION_REALTIME_MAX_SYMBOLS", 120))
         unique_symbols = []
 
@@ -43,7 +46,24 @@ class RealtimeMarketDataMonitor:
             if symbol and symbol not in unique_symbols:
                 unique_symbols.append(symbol)
 
-        self.symbols = unique_symbols[:max_symbols] if max_symbols > 0 else unique_symbols
+        self.allowed_symbols = set(unique_symbols)
+
+        if self.on_demand:
+            preload_symbols = max(
+                int(getattr(config, "DATA_CONFIRMATION_REALTIME_PRELOAD_SYMBOLS", 0)),
+                0
+            )
+            if max_symbols > 0:
+                preload_symbols = min(preload_symbols, max_symbols)
+            self.symbols = unique_symbols[:preload_symbols]
+        else:
+            self.symbols = unique_symbols[:max_symbols] if max_symbols > 0 else unique_symbols
+
+        now = time.time()
+        self.active_requested_at = {
+            symbol: now
+            for symbol in self.symbols
+        }
         self.shutdown_event = shutdown_event
         self.lock = threading.Lock()
         self.twm = None
@@ -76,35 +96,22 @@ class RealtimeMarketDataMonitor:
             return
 
         if not self.symbols:
+            if self.on_demand:
+                self._start_watchdog()
+                log_info(
+                    "Realtime data confirmation websocket idle | "
+                    "MODE=on_demand | ACTIVE_SYMBOLS=0"
+                )
+                return
+
             log_warning("Realtime data confirmation websocket skipped | no symbols")
-            return
-
-        self.streams = tuple(self._build_streams())
-
-        if not self.streams:
-            log_warning("Realtime data confirmation websocket skipped | no streams")
             return
 
         self._start_watchdog()
 
         try:
-            from binance import ThreadedWebsocketManager
-
-            self.twm = ThreadedWebsocketManager(
-                api_key=config.API_KEY,
-                api_secret=config.SECRET_KEY
-            )
-            self.twm.start()
-            self.stream_chunks = tuple(self._chunk_streams(self.streams))
-            self.socket_keys = self._start_stream_sockets(self.stream_chunks)
-            self.running = bool(self.socket_keys)
-            self.started_at = time.time()
-            self.last_message_at = self.started_at
-            log_info(
-                "Realtime data confirmation websocket started | "
-                f"SYMBOLS={len(self.symbols)} | STREAMS={len(self.streams)} | "
-                f"SOCKETS={len(self.socket_keys)}"
-            )
+            with self.lock:
+                self._open_streams_locked("startup")
 
         except Exception as exc:
             self.running = False
@@ -128,6 +135,77 @@ class RealtimeMarketDataMonitor:
                     )
 
             self.twm = None
+
+    def ensure_symbol(self, symbol):
+        if not self.enabled or not self.on_demand:
+            return True
+
+        symbol = str(symbol).upper().strip()
+
+        if not symbol:
+            return False
+
+        if self.allowed_symbols and symbol not in self.allowed_symbols:
+            return False
+
+        try:
+            with self.lock:
+                now = time.time()
+                already_active = symbol in self.symbols
+                self.active_requested_at[symbol] = now
+
+                if not already_active:
+                    self.symbols.append(symbol)
+
+                changed = self._trim_active_symbols_locked(now)
+
+                if already_active and not changed and self.running and self.streams:
+                    return True
+
+                self._open_streams_locked(f"candidate {symbol}")
+                return True
+
+        except Exception as exc:
+            log_error(
+                "Realtime data confirmation candidate subscribe error | "
+                f"SYMBOL={symbol} | ERROR={exc}"
+            )
+            return False
+
+    def wait_for_symbol(self, symbol, timeout_seconds=None):
+        symbol = str(symbol).upper().strip()
+        timeout = float(
+            timeout_seconds
+            if timeout_seconds is not None
+            else getattr(
+                config,
+                "DATA_CONFIRMATION_REALTIME_ON_DEMAND_WAIT_SECONDS",
+                6,
+            )
+        )
+
+        if timeout <= 0:
+            return self.snapshot(symbol)
+
+        deadline = time.time() + timeout
+        warm_reasons = {
+            "REALTIME_NO_DATA",
+            "REALTIME_SYMBOL_NOT_WATCHED",
+            "REALTIME_WARMING",
+        }
+
+        while time.time() < deadline and not self._shutdown_requested():
+            snapshot = self.snapshot(symbol)
+
+            if snapshot.get("available"):
+                return snapshot
+
+            if snapshot.get("reason") not in warm_reasons:
+                return snapshot
+
+            time.sleep(0.25)
+
+        return self.snapshot(symbol)
 
     def snapshot(self, symbol):
         if not self.enabled:
@@ -201,6 +279,83 @@ class RealtimeMarketDataMonitor:
         })
         return metrics
 
+    def _open_streams_locked(self, reason):
+        self._stop_socket_locked()
+        self.streams = tuple(self._build_streams())
+
+        if not self.streams:
+            self.stream_chunks = ()
+            self.running = False
+            if self.twm:
+                try:
+                    self.twm.stop()
+                except Exception as exc:
+                    log_warning(
+                        "Realtime data confirmation websocket manager idle stop warning: "
+                        f"{exc}"
+                    )
+                self.twm = None
+            log_info(
+                "Realtime data confirmation websocket idle | "
+                f"REASON={reason} | ACTIVE_SYMBOLS={len(self.symbols)}"
+            )
+            return
+
+        if not self.twm:
+            from binance import ThreadedWebsocketManager
+
+            self.twm = ThreadedWebsocketManager(
+                api_key=config.API_KEY,
+                api_secret=config.SECRET_KEY
+            )
+            self.twm.start()
+
+        self.stream_chunks = tuple(self._chunk_streams(self.streams))
+        self.socket_keys = self._start_stream_sockets(self.stream_chunks)
+        self.running = bool(self.socket_keys)
+        self.started_at = self.started_at or time.time()
+        self.last_message_at = time.time()
+        log_info(
+            "Realtime data confirmation websocket subscribed | "
+            f"REASON={reason} | ACTIVE_SYMBOLS={len(self.symbols)} | "
+            f"STREAMS={len(self.streams)} | SOCKETS={len(self.socket_keys)}"
+        )
+
+    def _trim_active_symbols_locked(self, now=None):
+        if not self.on_demand:
+            return False
+
+        now = now or time.time()
+        max_active = max(
+            int(getattr(config, "DATA_CONFIRMATION_REALTIME_MAX_ACTIVE_SYMBOLS", 20)),
+            1
+        )
+        ttl_seconds = float(
+            getattr(config, "DATA_CONFIRMATION_REALTIME_ACTIVE_TTL_SECONDS", 900)
+        )
+        original_symbols = list(self.symbols)
+        active_symbols = []
+
+        for symbol in self.symbols:
+            requested_at = self.active_requested_at.get(symbol, now)
+
+            if ttl_seconds <= 0 or now - requested_at <= ttl_seconds:
+                active_symbols.append(symbol)
+
+        active_symbols.sort(
+            key=lambda item: self.active_requested_at.get(item, 0),
+            reverse=True
+        )
+        self.symbols = active_symbols[:max_active]
+        active_set = set(self.symbols)
+
+        for symbol in list(self.active_requested_at.keys()):
+            if symbol not in active_set:
+                self.active_requested_at.pop(symbol, None)
+                self.state.pop(symbol, None)
+
+        return set(original_symbols) != active_set
+
     def _build_streams(self):
         enabled_streams = {
             item.strip().lower()
@@ -241,7 +396,7 @@ class RealtimeMarketDataMonitor:
             if force_order_enabled and not global_force_order:
                 yield f"{stream_symbol}@forceOrder"
 
-        if force_order_enabled and global_force_order:
+        if force_order_enabled and global_force_order and self.symbols:
             yield "!forceOrder@arr"
 
     def _start_watchdog(self):
@@ -278,10 +433,25 @@ class RealtimeMarketDataMonitor:
             self._watchdog_check()
 
     def _watchdog_check(self):
-        if not self.enabled or not self.streams or self.resetting:
+        if not self.enabled or self.resetting:
             return
 
         now = time.time()
+
+        if self.on_demand:
+            try:
+                with self.lock:
+                    if self._trim_active_symbols_locked(now):
+                        self._open_streams_locked("active ttl expired")
+            except Exception as exc:
+                log_warning(
+                    "Realtime data confirmation active symbol trim warning: "
+                    f"{exc}"
+                )
+
+        if not self.streams:
+            return
+
         stale_seconds = max(
             float(getattr(config, "DATA_CONFIRMATION_REALTIME_STALE_SECONDS", 45)),
             5.0
@@ -378,19 +548,10 @@ class RealtimeMarketDataMonitor:
                         f"{exc}"
                     )
 
-            from binance import ThreadedWebsocketManager
-
-            self.twm = ThreadedWebsocketManager(
-                api_key=config.API_KEY,
-                api_secret=config.SECRET_KEY
-            )
-            self.twm.start()
-            socket_keys = self._start_stream_sockets(self.stream_chunks)
-
             with self.lock:
-                self.socket_keys = socket_keys
-                self.running = bool(socket_keys)
-                self.last_message_at = time.time()
+                self.twm = None
+                self._trim_active_symbols_locked(time.time())
+                self._open_streams_locked(f"reset {reason}")
 
         except Exception as exc:
             with self.lock:
@@ -468,15 +629,22 @@ class RealtimeMarketDataMonitor:
         symbol = str(data.get("s") or "").upper()
 
         if event_type == "aggTrade":
+            with self.lock:
+                if self.on_demand and symbol not in self.symbols:
+                    return
             self._handle_trade(symbol, data)
         elif event_type == "depthUpdate":
+            with self.lock:
+                if self.on_demand and symbol not in self.symbols:
+                    return
             self._handle_depth(symbol, data)
         elif event_type == "forceOrder":
             order = data.get("o") or {}
             order_symbol = str(order.get("s") or symbol).upper()
 
-            if order_symbol not in self.symbols:
-                return
+            with self.lock:
+                if order_symbol not in self.symbols:
+                    return
 
             self._handle_liquidation(order_symbol, order)
 
@@ -802,5 +970,21 @@ def get_realtime_market_snapshot(symbol):
 
     if monitor is None:
         return {"available": False, "reason": "REALTIME_NOT_STARTED"}
+
+    if getattr(monitor, "on_demand", False):
+        if not monitor.ensure_symbol(symbol):
+            return {
+                "available": False,
+                "reason": "REALTIME_SYMBOL_NOT_WATCHED",
+            }
+
+        return monitor.wait_for_symbol(
+            symbol,
+            getattr(
+                config,
+                "DATA_CONFIRMATION_REALTIME_ON_DEMAND_WAIT_SECONDS",
+                6,
+            )
+        )
 
     return monitor.snapshot(symbol)
