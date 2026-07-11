@@ -539,6 +539,9 @@ def _live_entry_timeframe_check(side, df, mark_price, label):
             "ema_chase_atr": 0,
             "close_position": 0,
             "body_atr": 0,
+            "support_score": 0,
+            "supports_direction": False,
+            "opposes_direction": False,
             "mark_price": round(float(mark_price), 8) if mark_price else None,
             "latest_close": None,
             "reason": "INSUFFICIENT_DATA",
@@ -563,6 +566,9 @@ def _live_entry_timeframe_check(side, df, mark_price, label):
     ema_distance_pct = pct_distance(mark_price, ema20) if ema20 else 0
     ema_chase_atr = abs(mark_price - ema20) / atr if ema20 else 0
     ema_tolerance = ema20 * (ema_tolerance_pct / 100) if ema20 else 0
+    macd = _safe_float(latest.get("macd"))
+    macd_signal = _safe_float(latest.get("macd_signal"))
+    rsi = _safe_float(latest.get("rsi"), 50)
     ema_wrong_side = False
     ema_chase = False
     close_chase = False
@@ -587,6 +593,13 @@ def _live_entry_timeframe_check(side, df, mark_price, label):
             max_close_position > 0 and
             close_position > max_close_position
         )
+        direction_ok = _is_bullish(latest)
+        opposite_direction = _is_bearish(latest)
+        directional_close = close_position
+        ema_support = bool(ema20 and mark_price >= ema20 - ema_tolerance)
+        oscillator_support = macd > macd_signal or rsi >= 50
+        oscillator_opposes = macd < macd_signal and rsi < 48
+        mark_support = mark_price >= float(latest["close"])
         reason = "BUY_GUARD"
     else:
         recent_high = float(previous["high"].max())
@@ -608,7 +621,34 @@ def _live_entry_timeframe_check(side, df, mark_price, label):
             max_close_position > 0 and
             close_position < 1 - max_close_position
         )
+        direction_ok = _is_bearish(latest)
+        opposite_direction = _is_bullish(latest)
+        directional_close = 1 - close_position
+        ema_support = bool(ema20 and mark_price <= ema20 + ema_tolerance)
+        oscillator_support = macd < macd_signal or rsi <= 50
+        oscillator_opposes = macd > macd_signal and rsi > 52
+        mark_support = mark_price <= float(latest["close"])
         reason = "SELL_GUARD"
+
+    support_score = 0
+    support_score += 0.50 if direction_ok else 0
+    support_score -= 0.50 if opposite_direction else 0
+    support_score += 0.75 if ema_support else 0
+    support_score -= 0.75 if ema_wrong_side else 0
+    support_score += 0.35 if oscillator_support else 0
+    support_score -= 0.35 if oscillator_opposes else 0
+    support_score += 0.35 if directional_close >= 0.50 else 0
+    support_score -= 0.35 if directional_close < 0.40 else 0
+    support_score += 0.25 if mark_support else 0
+    support_score -= 0.50 if opposite_reversal else 0
+
+    min_support_score = get_config_float("LIVE_ENTRY_MIN_SUPPORT_SCORE", 1.0)
+    opposition_score = get_config_float(
+        "LIVE_ENTRY_DUAL_OPPOSITION_BLOCK_SCORE",
+        -0.75
+    )
+    supports_direction = support_score >= min_support_score
+    opposes_direction = support_score <= opposition_score
 
     return {
         "label": label,
@@ -623,6 +663,9 @@ def _live_entry_timeframe_check(side, df, mark_price, label):
         "ema_chase_atr": round(float(ema_chase_atr), 2),
         "close_position": round(float(close_position), 2),
         "body_atr": round(float(body_atr), 2),
+        "support_score": round(float(support_score), 2),
+        "supports_direction": supports_direction,
+        "opposes_direction": opposes_direction,
         "mark_price": round(float(mark_price), 8),
         "latest_close": round(float(latest["close"]), 8),
         "reason": reason,
@@ -661,6 +704,12 @@ def validate_live_entry_guard(side, fast_df, slow_df, mark_price):
         dual_ema_chase or
         (dual_close_chase and (fast["ema_chase"] or slow["ema_chase"]))
     )
+    support_count = int(fast.get("supports_direction", False)) + int(
+        slow.get("supports_direction", False)
+    )
+    opposition_count = int(fast.get("opposes_direction", False)) + int(
+        slow.get("opposes_direction", False)
+    )
 
     if structure_break or dual_reversal or live_ema_block:
         if structure_break:
@@ -680,11 +729,46 @@ def validate_live_entry_guard(side, fast_df, slow_df, mark_price):
             "mark_price": mark_price,
         }
 
+    if getattr(config, "LIVE_ENTRY_REQUIRE_DIRECTION_SUPPORT", True):
+        require_both = bool(getattr(config, "LIVE_ENTRY_REQUIRE_BOTH_TIMEFRAMES", False))
+
+        if opposition_count >= 2:
+            return False, {
+                "reason": "DUAL_LIVE_DIRECTION_OPPOSITION",
+                "fast": fast,
+                "slow": slow,
+                "mark_price": mark_price,
+                "support_count": support_count,
+                "opposition_count": opposition_count,
+            }
+
+        if require_both and support_count < 2:
+            return False, {
+                "reason": "LIVE_DIRECTION_SUPPORT_MISSING_BOTH",
+                "fast": fast,
+                "slow": slow,
+                "mark_price": mark_price,
+                "support_count": support_count,
+                "opposition_count": opposition_count,
+            }
+
+        if not require_both and support_count < 1:
+            return False, {
+                "reason": "LIVE_DIRECTION_SUPPORT_MISSING",
+                "fast": fast,
+                "slow": slow,
+                "mark_price": mark_price,
+                "support_count": support_count,
+                "opposition_count": opposition_count,
+            }
+
     return True, {
         "reason": "LIVE_ENTRY_GUARD_OK",
         "fast": fast,
         "slow": slow,
         "mark_price": mark_price,
+        "support_count": support_count,
+        "opposition_count": opposition_count,
     }
 
 
@@ -1713,6 +1797,16 @@ def _entry_score(side, entry_df):
     entry = latest_closed(entry_df)
     prev = previous_closed(entry_df)
     ema_distance = pct_distance(entry["close"], entry["ema20"])
+    atr = max(_safe_float(entry.get("atr")), 1e-10)
+    ema20 = _safe_float(entry.get("ema20"))
+    chase_atr = abs(_safe_float(entry.get("close")) - ema20) / atr if ema20 else 0
+    late_block_enabled = bool(getattr(config, "LATE_ENTRY_HARD_BLOCK_ENABLED", True))
+    hard_late_limit = get_config_float("MAX_LATE_ENTRY_HARD_BLOCK_ATR", 2.6)
+    late_entry_ok = (
+        not late_block_enabled or
+        hard_late_limit <= 0 or
+        chase_atr <= hard_late_limit
+    )
     max_ema_distance = get_config_float(
         "MAX_ENTRY_EMA20_DISTANCE_PCT",
         get_config_float("LONG_TERM_ENTRY_MAX_EMA_DISTANCE_PCT", 6)
@@ -1747,7 +1841,9 @@ def _entry_score(side, entry_df):
         max_ema_distance
     )
     score += quality_score
-    hard_ok = hard_ok and quality["quality_ok"]
+    hard_ok = hard_ok and quality["quality_ok"] and late_entry_ok
+    quality["late_entry_ok"] = late_entry_ok
+    quality["hard_late_limit_atr"] = round(float(hard_late_limit), 2)
 
     return round(score, 2), hard_ok, ema_distance, quality
 
@@ -1822,7 +1918,26 @@ def _futures_participation_score(side, participation):
             score -= 1 if funding_rate <= -funding_abs_max else 0
             score = add_score(score, funding_rate >= funding_abs_max, 0.5)
 
-    return round(score, 2)
+    weight = get_config_float("FUTURES_CONTEXT_SCORE_WEIGHT", 1.15)
+    return round(score * weight, 2)
+
+
+def _futures_context_gate(participation_score, participation):
+    if not getattr(config, "FUTURES_CONTEXT_BLOCK_CONFLICT_ENABLED", True):
+        return True, []
+
+    if not participation or not participation.get("available"):
+        return True, []
+
+    minimum = get_config_float("FUTURES_CONTEXT_MIN_SIGNAL_SCORE", -0.5)
+    score = _safe_float(participation_score)
+
+    if score < minimum:
+        return False, [
+            f"FUTURES_CONTEXT_CONFLICT={round(score, 2)} < {minimum}"
+        ]
+
+    return True, []
 
 
 def _module_gates_check(
@@ -2183,6 +2298,10 @@ def _side_signal_score(
     entry_score, entry_ok, ema_distance, entry_quality = _entry_score(side, entry_df)
     btc_score = _btc_context_score(side, btc_trend, btc_corr, rs)
     participation_score = _futures_participation_score(side, participation)
+    futures_ok, futures_gate_reasons = _futures_context_gate(
+        participation_score,
+        participation
+    )
     smc_score, smc_context = _smc_context_score(side, trend_df, confirm_df, entry_df)
     smc_ok, _ = _reversal_smc_check(smc_score, smc_context)
     momentum_score, momentum_context = _reversal_momentum_context(
@@ -2234,7 +2353,8 @@ def _side_signal_score(
         confirm_ok and
         entry_ok and
         level_ok and
-        module_gates_ok
+        module_gates_ok and
+        futures_ok
     )
     reversal_ok, reversal_reasons, reversal_context = _reversal_signal_check(
         side,
@@ -2253,6 +2373,11 @@ def _side_signal_score(
         entry_ok,
         level_ok
     )
+
+    if not futures_ok:
+        reversal_ok = False
+        reversal_reasons = list(reversal_reasons) + futures_gate_reasons
+
     hard_ok = trend_following_ok or reversal_ok
     confirmation_type = (
         "TREND" if trend_following_ok
@@ -2286,6 +2411,8 @@ def _side_signal_score(
         "regime_score": regime_score,
         "regime_context": regime_context,
         "participation_score": participation_score,
+        "futures_context_ok": futures_ok,
+        "futures_gate_reasons": futures_gate_reasons,
         "hard_ok": hard_ok,
         "trend_following_ok": trend_following_ok,
         "reversal_ok": reversal_ok,
@@ -2388,7 +2515,8 @@ def log_signal_analysis(analysis):
         f"{buy.get('regime_score', 0)} "
         f"smc={buy.get('smc_score', 0)} "
         f"momentum={buy.get('momentum_score', 0)} "
-        f"futures={buy.get('participation_score', 0)} | "
+        f"futures={buy.get('participation_score', 0)} "
+        f"futures_ok={buy.get('futures_context_ok', True)} | "
         f"SELL conf={sell.get('confidence', 0)}% "
         f"hard={sell.get('hard_ok', False)} "
         f"type={sell.get('confirmation_type', 'NONE')} "
@@ -2399,8 +2527,21 @@ def log_signal_analysis(analysis):
         f"{sell.get('regime_score', 0)} "
         f"smc={sell.get('smc_score', 0)} "
         f"momentum={sell.get('momentum_score', 0)} "
-        f"futures={sell.get('participation_score', 0)}"
+        f"futures={sell.get('participation_score', 0)} "
+        f"futures_ok={sell.get('futures_context_ok', True)}"
     )
+
+    if not buy.get("futures_context_ok", True):
+        log_warning(
+            "BUY FUTURES CONTEXT BLOCKED | " +
+            "; ".join(buy.get("futures_gate_reasons", []))
+        )
+
+    if not sell.get("futures_context_ok", True):
+        log_warning(
+            "SELL FUTURES CONTEXT BLOCKED | " +
+            "; ".join(sell.get("futures_gate_reasons", []))
+        )
 
     if buy.get("reversal_ok"):
         log_info(

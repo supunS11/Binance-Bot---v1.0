@@ -69,6 +69,10 @@ from trade_state import (
     upsert_position_state
 )
 from logger import log_info, log_warning, log_error
+from realtime_market_data import (
+    start_realtime_market_data,
+    stop_realtime_market_data
+)
 
 
 trade_times = {}
@@ -2435,7 +2439,12 @@ def execute_entry_candidate(
             f"ADJ={llm_context.get('confidence_adjustment')}"
         )
 
-        data_context = confirm_market_data(symbol, signal, entry_df=entry_df)
+        data_context = confirm_market_data(
+            symbol,
+            signal,
+            entry_df=entry_df,
+            participation=participation
+        )
         final_analysis["data_confirmation"] = data_context
 
         log_info(
@@ -2445,7 +2454,10 @@ def execute_entry_candidate(
             f"EDGE={data_context.get('edge')} | "
             f"OK={data_context.get('ok')} | "
             f"REASON={data_context.get('reason')} | "
-            f"CONFIRMATIONS={','.join(data_context.get('confirmations', []))}"
+            f"CONFIRMATIONS={','.join(data_context.get('confirmations', []))} | "
+            f"RT={data_context.get('realtime', {}).get('reason')} "
+            f"RT_VETO={data_context.get('realtime_veto')} "
+            f"RT_SCORE={data_context.get('realtime_veto_score')}"
         )
 
         if not data_context.get("ok"):
@@ -2703,6 +2715,10 @@ def run_bot():
         f"THROTTLE={config.REQUEST_THROTTLE_SECONDS}s"
     )
     log_active_dca_config()
+    realtime_monitor = start_realtime_market_data(
+        scan_symbols,
+        shutdown_event=shutdown_event
+    )
     dca_monitor = DcaWebsocketMonitor()
     dca_monitor.start()
     target_margin_monitor = TargetMarginBalanceMonitor()
@@ -2890,6 +2906,7 @@ def run_bot():
     finally:
         target_margin_monitor.stop()
         dca_monitor.stop()
+        stop_realtime_market_data()
 
     log_warning("BOT STOPPED | manual restart required")
 

@@ -8,8 +8,9 @@ from binance_rate_limit import (
     is_binance_rate_limit_error,
     register_private_rate_limit
 )
-from exchange import client, get_klines
+from exchange import client, get_futures_participation, get_klines
 from logger import log_warning
+from realtime_market_data import get_realtime_market_snapshot
 
 
 _cache = {}
@@ -74,9 +75,21 @@ def _cache_get(symbol):
 
 
 def _cache_set(symbol, data):
+    cached_data = dict(data)
+
+    for key in (
+        "realtime",
+        "realtime_veto",
+        "realtime_veto_score",
+        "realtime_veto_reason",
+        "realtime_conflicts",
+        "realtime_supports",
+    ):
+        cached_data.pop(key, None)
+
     _cache[symbol] = {
         "time": time.time(),
-        "data": data,
+        "data": cached_data,
     }
     return data
 
@@ -286,6 +299,197 @@ def _liquidation_metrics(symbol):
     return _clamp(imbalance, -1, 1), None
 
 
+def _crowding_metrics(symbol, participation=None):
+    result = {
+        "taker_buy_sell_bias": 0,
+        "crowding_bias": 0,
+        "taker_buy_sell_ratio": None,
+        "global_long_short_ratio": None,
+        "top_long_short_ratio": None,
+        "crowding_error": None,
+    }
+
+    if not getattr(config, "DATA_CONFIRMATION_CROWDING_ENABLED", True):
+        return result
+
+    try:
+        if participation is None:
+            participation = get_futures_participation(symbol)
+
+        if not participation or not participation.get("available"):
+            return result
+
+        taker_ratio = _safe_float(participation.get("taker_buy_sell_ratio"), None)
+        global_ratio = _safe_float(participation.get("global_long_short_ratio"), None)
+        top_ratio = _safe_float(participation.get("top_long_short_ratio"), None)
+        result.update({
+            "taker_buy_sell_ratio": taker_ratio,
+            "global_long_short_ratio": global_ratio,
+            "top_long_short_ratio": top_ratio,
+        })
+
+        if taker_ratio and taker_ratio > 0:
+            result["taker_buy_sell_bias"] = _clamp(
+                _normalise(taker_ratio - 1, 0.25),
+                -1,
+                1
+            )
+
+        crowd_ratio = top_ratio if top_ratio else global_ratio
+
+        if crowd_ratio and crowd_ratio > 0:
+            long_max = max(
+                _safe_float(
+                    getattr(config, "DATA_CONFIRMATION_CROWD_LONG_MAX", 2.2),
+                    2.2
+                ),
+                1.01
+            )
+            short_min = min(
+                max(
+                    _safe_float(
+                        getattr(config, "DATA_CONFIRMATION_CROWD_SHORT_MIN", 0.45),
+                        0.45
+                    ),
+                    0.01
+                ),
+                0.99
+            )
+
+            if crowd_ratio >= long_max:
+                result["crowding_bias"] = -_clamp(
+                    _normalise(crowd_ratio - long_max, long_max - 1),
+                    0,
+                    1
+                )
+            elif crowd_ratio <= short_min:
+                result["crowding_bias"] = _clamp(
+                    _normalise(short_min - crowd_ratio, 1 - short_min),
+                    0,
+                    1
+                )
+
+        return result
+
+    except Exception as exc:
+        _record_rate_limit(exc, "crowding")
+        result["crowding_error"] = f"CROWDING:{exc}"
+        return result
+
+
+def _signed_for_side(value, side):
+    return value if side == "BUY" else -value
+
+
+def _realtime_veto(snapshot, chart_side):
+    if not getattr(config, "DATA_CONFIRMATION_REALTIME_ENABLED", True):
+        return False, 0.0, [], []
+
+    if not snapshot.get("available"):
+        return False, 0.0, [], []
+
+    cvd_at = abs(
+        _safe_float(
+            getattr(config, "DATA_CONFIRMATION_REALTIME_CVD_CONFLICT_AT", 0.18),
+            0.18
+        )
+    )
+    book_at = abs(
+        _safe_float(
+            getattr(config, "DATA_CONFIRMATION_REALTIME_BOOK_CONFLICT_AT", 0.12),
+            0.12
+        )
+    )
+    weights = {
+        "live_cvd_1m": _safe_float(
+            getattr(config, "DATA_CONFIRMATION_REALTIME_WEIGHT_CVD", 0.80),
+            0.80
+        ),
+        "live_cvd_3m": _safe_float(
+            getattr(config, "DATA_CONFIRMATION_REALTIME_WEIGHT_CVD", 0.80),
+            0.80
+        ),
+        "book_pressure": _safe_float(
+            getattr(config, "DATA_CONFIRMATION_REALTIME_WEIGHT_BOOK", 0.45),
+            0.45
+        ),
+        "absorption_bias": _safe_float(
+            getattr(config, "DATA_CONFIRMATION_REALTIME_WEIGHT_ABSORPTION", 0.80),
+            0.80
+        ),
+        "liquidation_reaction_bias": _safe_float(
+            getattr(config, "DATA_CONFIRMATION_REALTIME_WEIGHT_LIQUIDATION", 0.45),
+            0.45
+        ),
+    }
+    thresholds = {
+        "live_cvd_1m": cvd_at,
+        "live_cvd_3m": cvd_at,
+        "book_pressure": book_at,
+        "absorption_bias": cvd_at,
+        "liquidation_reaction_bias": cvd_at,
+    }
+    conflict_score = 0.0
+    support_score = 0.0
+    conflicts = []
+    supports = []
+
+    for name, weight in weights.items():
+        if weight <= 0:
+            continue
+
+        value = _safe_float(snapshot.get(name))
+        signed = _signed_for_side(value, chart_side)
+        threshold = thresholds[name]
+
+        if signed <= -threshold:
+            conflict_score += weight
+            conflicts.append(name)
+        elif signed >= threshold:
+            support_score += weight
+            supports.append(name)
+
+    net_veto_score = max(conflict_score - (support_score * 0.60), 0)
+    min_veto = _safe_float(
+        getattr(config, "DATA_CONFIRMATION_REALTIME_MIN_VETO_SCORE", 1.60),
+        1.60
+    )
+    return net_veto_score >= min_veto, round(net_veto_score, 2), conflicts, supports
+
+
+def _apply_realtime_context(symbol, context, chart_side):
+    if not getattr(config, "DATA_CONFIRMATION_REALTIME_ENABLED", True):
+        context["realtime"] = {"available": False, "reason": "REALTIME_DISABLED"}
+        context["realtime_veto"] = False
+        return context
+
+    snapshot = get_realtime_market_snapshot(symbol)
+    context["realtime"] = snapshot
+
+    if (
+        not snapshot.get("available")
+        and not getattr(config, "DATA_CONFIRMATION_REALTIME_FAIL_OPEN", True)
+    ):
+        context["realtime_veto"] = True
+        context["realtime_veto_score"] = 0
+        context["realtime_conflicts"] = ["realtime_unavailable"]
+        context["realtime_supports"] = []
+        context["realtime_veto_reason"] = snapshot.get("reason", "REALTIME_UNAVAILABLE")
+        return context
+
+    veto, score, conflicts, supports = _realtime_veto(snapshot, chart_side)
+    context["realtime_veto"] = veto
+    context["realtime_veto_score"] = score
+    context["realtime_conflicts"] = conflicts
+    context["realtime_supports"] = supports
+    context["realtime_veto_reason"] = (
+        "REALTIME_FLOW_CONFLICT " + ",".join(conflicts)
+        if veto
+        else snapshot.get("reason", "REALTIME_OK")
+    )
+    return context
+
+
 def _metric_weight(name, default):
     return max(_safe_float(getattr(config, name, default), default), 0)
 
@@ -312,7 +516,7 @@ def _classify_metric(name, value, weight, side, confirmations, conflicts):
     return None
 
 
-def confirm_market_data(symbol, chart_side, entry_df=None):
+def confirm_market_data(symbol, chart_side, entry_df=None, participation=None):
     context = {
         "enabled": bool(getattr(config, "DATA_CONFIRMATION_ENABLED", True)),
         "ok": True,
@@ -325,6 +529,8 @@ def confirm_market_data(symbol, chart_side, entry_df=None):
         "confirmations": [],
         "conflicts": [],
         "metrics": {},
+        "realtime": {},
+        "realtime_veto": False,
         "errors": [],
     }
 
@@ -335,6 +541,7 @@ def confirm_market_data(symbol, chart_side, entry_df=None):
 
     if cached:
         context = dict(cached)
+        _apply_realtime_context(symbol, context, chart_side)
         context["ok"] = _decision_ok(context, chart_side)
         context["reason"] = _decision_reason(context, chart_side)
         return context
@@ -343,6 +550,7 @@ def confirm_market_data(symbol, chart_side, entry_df=None):
         metrics = {}
         metrics.update(_order_book_metrics(symbol))
         metrics.update(_flow_metrics(symbol, entry_df))
+        metrics.update(_crowding_metrics(symbol, participation=participation))
 
         oi_bias, oi_change_pct, oi_error = _open_interest_bias(
             symbol,
@@ -361,6 +569,9 @@ def confirm_market_data(symbol, chart_side, entry_df=None):
             error for error in (oi_error, funding_error, liquidation_error)
             if error
         ]
+        if metrics.get("crowding_error"):
+            errors.append(metrics["crowding_error"])
+
         weighted = {
             "order_book": (
                 metrics["order_book_imbalance"],
@@ -393,6 +604,14 @@ def confirm_market_data(symbol, chart_side, entry_df=None):
             "whale_orders": (
                 metrics["whale_imbalance"],
                 _metric_weight("DATA_CONFIRMATION_WEIGHT_WHALE_ORDERS", 0.20),
+            ),
+            "taker_ratio": (
+                metrics["taker_buy_sell_bias"],
+                _metric_weight("DATA_CONFIRMATION_WEIGHT_TAKER_RATIO", 0.45),
+            ),
+            "crowding": (
+                metrics["crowding_bias"],
+                _metric_weight("DATA_CONFIRMATION_WEIGHT_CROWDING", 0.30),
             ),
         }
         weighted = {
@@ -463,6 +682,7 @@ def confirm_market_data(symbol, chart_side, entry_df=None):
             },
             "errors": errors,
         }
+        _apply_realtime_context(symbol, context, chart_side)
         context["ok"] = _decision_ok(context, chart_side)
         context["reason"] = _decision_reason(context, chart_side)
         return _cache_set(symbol, context)
@@ -482,6 +702,9 @@ def confirm_market_data(symbol, chart_side, entry_df=None):
 def _decision_ok(context, chart_side):
     if not context.get("enabled"):
         return True
+
+    if context.get("realtime_veto"):
+        return False
 
     if context.get("side") != chart_side:
         return False
@@ -519,6 +742,13 @@ def _decision_ok(context, chart_side):
 def _decision_reason(context, chart_side):
     if not context.get("enabled"):
         return "DATA_CONFIRMATION_DISABLED"
+
+    if context.get("realtime_veto"):
+        return (
+            f"{context.get('realtime_veto_reason')} "
+            f"score={context.get('realtime_veto_score')} "
+            f"supports={','.join(context.get('realtime_supports', []) or [])}"
+        )
 
     side = context.get("side")
 
