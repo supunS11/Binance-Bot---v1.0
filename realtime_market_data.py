@@ -215,6 +215,13 @@ class RealtimeMarketDataMonitor:
         depth_speed = str(
             getattr(config, "DATA_CONFIRMATION_REALTIME_DEPTH_SPEED", "500ms")
         )
+        force_order_enabled = (
+            "forceorder" in enabled_streams or
+            "liquidation" in enabled_streams
+        )
+        global_force_order = bool(
+            getattr(config, "DATA_CONFIRMATION_REALTIME_GLOBAL_FORCE_ORDER", True)
+        )
 
         for index, symbol in enumerate(self.symbols):
             stream_symbol = symbol.lower()
@@ -231,8 +238,11 @@ class RealtimeMarketDataMonitor:
             if depth_enabled and depth_allowed:
                 yield f"{stream_symbol}@depth{depth_levels}@{depth_speed}"
 
-            if "forceorder" in enabled_streams or "liquidation" in enabled_streams:
+            if force_order_enabled and not global_force_order:
                 yield f"{stream_symbol}@forceOrder"
+
+        if force_order_enabled and global_force_order:
+            yield "!forceOrder@arr"
 
     def _start_watchdog(self):
         if not getattr(config, "DATA_CONFIRMATION_REALTIME_WATCHDOG_ENABLED", True):
@@ -444,7 +454,12 @@ class RealtimeMarketDataMonitor:
             self._handle_depth(symbol, data)
         elif event_type == "forceOrder":
             order = data.get("o") or {}
-            self._handle_liquidation(str(order.get("s") or symbol).upper(), order)
+            order_symbol = str(order.get("s") or symbol).upper()
+
+            if order_symbol not in self.symbols:
+                return
+
+            self._handle_liquidation(order_symbol, order)
 
     def _handle_trade(self, symbol, data):
         if not symbol:
