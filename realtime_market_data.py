@@ -326,12 +326,31 @@ class RealtimeMarketDataMonitor:
         if self._shutdown_requested():
             return
 
+        now = time.time()
+        cooldown = max(
+            float(
+                getattr(
+                    config,
+                    "DATA_CONFIRMATION_REALTIME_RESTART_COOLDOWN_SECONDS",
+                    30,
+                )
+            ),
+            5.0
+        )
+
         with self.lock:
             if self.resetting:
                 return
 
+            if self.last_restart_at and now - self.last_restart_at < cooldown:
+                log_warning(
+                    "Realtime data confirmation websocket reset ignored | "
+                    f"REASON={reason} | COOLDOWN_SECONDS={round(cooldown, 1)}"
+                )
+                return
+
             self.resetting = True
-            self.last_restart_at = time.time()
+            self.last_restart_at = now
 
         thread = threading.Thread(
             target=self._reset_connection,
