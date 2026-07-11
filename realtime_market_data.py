@@ -209,17 +209,26 @@ class RealtimeMarketDataMonitor:
         depth_levels = int(
             getattr(config, "DATA_CONFIRMATION_REALTIME_DEPTH_LEVELS", 10)
         )
+        depth_max_symbols = int(
+            getattr(config, "DATA_CONFIRMATION_REALTIME_DEPTH_MAX_SYMBOLS", 60)
+        )
         depth_speed = str(
             getattr(config, "DATA_CONFIRMATION_REALTIME_DEPTH_SPEED", "500ms")
         )
 
-        for symbol in self.symbols:
+        for index, symbol in enumerate(self.symbols):
             stream_symbol = symbol.lower()
 
             if "aggtrade" in enabled_streams or "agg_trade" in enabled_streams:
                 yield f"{stream_symbol}@aggTrade"
 
-            if "depth" in enabled_streams or "book" in enabled_streams:
+            depth_enabled = (
+                "depth" in enabled_streams or
+                "book" in enabled_streams
+            )
+            depth_allowed = depth_max_symbols <= 0 or index < depth_max_symbols
+
+            if depth_enabled and depth_allowed:
                 yield f"{stream_symbol}@depth{depth_levels}@{depth_speed}"
 
             if "forceorder" in enabled_streams or "liquidation" in enabled_streams:
