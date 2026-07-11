@@ -287,10 +287,14 @@ DATA_CONFIRMATION_REALTIME_STREAMS = [
     item.strip()
     for item in os.getenv(
         "DATA_CONFIRMATION_REALTIME_STREAMS",
-        "aggTrade,depth,forceOrder"
+        "aggTrade,forceOrder"
     ).split(",")
     if item.strip()
 ]
+DATA_CONFIRMATION_REALTIME_STREAM_CHUNK_SIZE = env_int(
+    "DATA_CONFIRMATION_REALTIME_STREAM_CHUNK_SIZE",
+    80
+)
 DATA_CONFIRMATION_REALTIME_DEPTH_LEVELS = env_int(
     "DATA_CONFIRMATION_REALTIME_DEPTH_LEVELS",
     10

@@ -47,13 +47,14 @@ class RealtimeMarketDataMonitor:
         self.shutdown_event = shutdown_event
         self.lock = threading.Lock()
         self.twm = None
-        self.socket_key = None
+        self.socket_keys = []
         self.running = False
         self.resetting = False
         self.started_at = 0.0
         self.last_message_at = 0.0
         self.last_restart_at = 0.0
         self.streams = ()
+        self.stream_chunks = ()
         self.watchdog_thread = None
         self.watchdog_stop_event = threading.Event()
         self.state = defaultdict(self._new_symbol_state)
@@ -94,21 +95,20 @@ class RealtimeMarketDataMonitor:
                 api_secret=config.SECRET_KEY
             )
             self.twm.start()
-            self.socket_key = self.twm.start_futures_multiplex_socket(
-                callback=self.handle_message,
-                streams=list(self.streams)
-            )
-            self.running = True
+            self.stream_chunks = tuple(self._chunk_streams(self.streams))
+            self.socket_keys = self._start_stream_sockets(self.stream_chunks)
+            self.running = bool(self.socket_keys)
             self.started_at = time.time()
             self.last_message_at = self.started_at
             log_info(
                 "Realtime data confirmation websocket started | "
-                f"SYMBOLS={len(self.symbols)} | STREAMS={len(self.streams)}"
+                f"SYMBOLS={len(self.symbols)} | STREAMS={len(self.streams)} | "
+                f"SOCKETS={len(self.socket_keys)}"
             )
 
         except Exception as exc:
             self.running = False
-            self.socket_key = None
+            self.socket_keys = []
             log_error(f"Realtime data confirmation websocket start error: {exc}")
 
     def stop(self):
@@ -290,10 +290,10 @@ class RealtimeMarketDataMonitor:
         with self.lock:
             last_message_at = self.last_message_at
             running = self.running
-            socket_key = self.socket_key
+            socket_count = len(self.socket_keys)
             last_restart_at = self.last_restart_at
 
-        if not running or not socket_key:
+        if not running or socket_count <= 0:
             reason = "socket not running"
         else:
             age = now - last_message_at if last_message_at else stale_seconds + 1
@@ -313,8 +313,15 @@ class RealtimeMarketDataMonitor:
         self.reset_connection(reason)
 
     def reset_connection(self, reason):
-        if self._shutdown_requested() or self.resetting:
+        if self._shutdown_requested():
             return
+
+        with self.lock:
+            if self.resetting:
+                return
+
+            self.resetting = True
+            self.last_restart_at = time.time()
 
         thread = threading.Thread(
             target=self._reset_connection,
@@ -324,13 +331,6 @@ class RealtimeMarketDataMonitor:
         thread.start()
 
     def _reset_connection(self, reason):
-        with self.lock:
-            if self.resetting:
-                return
-
-            self.resetting = True
-            self.last_restart_at = time.time()
-
         try:
             log_warning(
                 "Realtime data confirmation websocket resetting | "
@@ -356,19 +356,17 @@ class RealtimeMarketDataMonitor:
                 api_secret=config.SECRET_KEY
             )
             self.twm.start()
-            self.socket_key = self.twm.start_futures_multiplex_socket(
-                callback=self.handle_message,
-                streams=list(self.streams)
-            )
+            socket_keys = self._start_stream_sockets(self.stream_chunks)
 
             with self.lock:
-                self.running = True
+                self.socket_keys = socket_keys
+                self.running = bool(socket_keys)
                 self.last_message_at = time.time()
 
         except Exception as exc:
             with self.lock:
                 self.running = False
-                self.socket_key = None
+                self.socket_keys = []
 
             log_error(
                 "Realtime data confirmation websocket reset error: "
@@ -379,20 +377,50 @@ class RealtimeMarketDataMonitor:
             with self.lock:
                 self.resetting = False
 
-    def _stop_socket_locked(self):
-        if not self.socket_key or not self.twm:
-            self.socket_key = None
-            return
+    def _chunk_streams(self, streams):
+        chunk_size = max(
+            int(getattr(config, "DATA_CONFIRMATION_REALTIME_STREAM_CHUNK_SIZE", 80)),
+            1
+        )
+        stream_list = list(streams)
 
-        try:
-            self.twm.stop_socket(self.socket_key)
-        except Exception as exc:
-            log_warning(
-                "Realtime data confirmation websocket socket stop warning: "
-                f"{exc}"
+        for index in range(0, len(stream_list), chunk_size):
+            yield tuple(stream_list[index:index + chunk_size])
+
+    def _start_stream_sockets(self, stream_chunks):
+        socket_keys = []
+
+        for index, chunk in enumerate(stream_chunks, start=1):
+            if not chunk:
+                continue
+
+            key = self.twm.start_futures_multiplex_socket(
+                callback=self.handle_message,
+                streams=list(chunk)
+            )
+            socket_keys.append(key)
+            log_info(
+                "Realtime data confirmation websocket chunk started | "
+                f"CHUNK={index} | STREAMS={len(chunk)}"
             )
 
-        self.socket_key = None
+        return socket_keys
+
+    def _stop_socket_locked(self):
+        if not self.socket_keys or not self.twm:
+            self.socket_keys = []
+            return
+
+        for socket_key in list(self.socket_keys):
+            try:
+                self.twm.stop_socket(socket_key)
+            except Exception as exc:
+                log_warning(
+                    "Realtime data confirmation websocket socket stop warning: "
+                    f"{exc}"
+                )
+
+        self.socket_keys = []
 
     def handle_message(self, message):
         if self._shutdown_requested():
